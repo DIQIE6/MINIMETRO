@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      TEMPORARY SCAFFOLDING - delete after the river generator is tuned.
+      Removal checklist: tools/RIVER-LAB.md
+    -->
+    <title>River Lab (temporary)</title>
+    <style>
+      :root {
+        --paper: #f2efe8;
+        --bg: #eae6dd;
+        --ink: #39393b;
+        --river: #bcd6e8;
+        --river-edge: #a8c6dc;
+        --good: #2f8f5b;
+        --bad: #c0503f;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+        color: var(--ink);
+        background: var(--bg);
+        display: flex;
+        height: 100vh;
+        overflow: hidden;
+      }
+      #stage { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; }
+      canvas {
+        background: var(--paper);
+        border-radius: 10px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.14);
+        max-width: 100%;
+        max-height: 100%;
+      }
+      #panel {
+        width: 360px;
+        background: #fff;
+        border-left: 1px solid #dcd6c9;
+        padding: 16px 18px;
+        overflow-y: auto;
+      }
+      h1 { font-size: 15px; margin: 0 0 4px; }
+      h2 { font-size: 12px; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.6; }
+      .muted { opacity: 0.62; }
+      kbd {
+        display: inline-block; min-width: 20px; text-align: center;
+        padding: 1px 5px; border: 1px solid #c9c2b3; border-bottom-width: 2px;
+        border-radius: 4px; background: #faf8f3; font: inherit; font-size: 11px;
+      }
+      .knobs { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; font-size: 12px; }
+      .knobs b { font-weight: 600; }
+      .bar { height: 6px; background: #eee7d9; border-radius: 3px; overflow: hidden; margin-top: 3px; }
+      .bar i { display: block; height: 100%; background: #c8bda6; }
+      .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      button {
+        font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 7px;
+        border: 1px solid #cfc7b6; background: #faf8f3; cursor: pointer;
+      }
+      button:hover { background: #f2eee4; }
+      button.rate { font-size: 15px; font-weight: 700; padding: 7px 0; flex: 1; }
+      button.rate[data-v="5"] { border-color: #9dc7ae; }
+      button.rate[data-v="1"] { border-color: #e0b3aa; }
+      #hist { display: flex; align-items: flex-end; gap: 5px; height: 54px; margin-top: 4px; }
+      #hist div { flex: 1; background: #cfc7b6; border-radius: 3px 3px 0 0; position: relative; }
+      #hist div span { position: absolute; top: -15px; width: 100%; text-align: center; font-size: 10px; opacity: 0.6; }
+      #seeds { max-height: 110px; overflow-y: auto; font-size: 11px; }
+      #seeds div { display: flex; gap: 6px; }
+      #notes { max-height: 150px; overflow-y: auto; font-size: 11px; }
+      #notes div { border-top: 1px solid #f0ece2; padding: 3px 0; }
+      #notes i { font-style: normal; opacity: 0.55; }
+      textarea {
+        width: 100%; min-height: 54px; resize: vertical; font: inherit; font-size: 12px;
+        padding: 6px 8px; border: 1px solid #cfc7b6; border-radius: 7px; background: #fdfcf9;
+      }
+      .pill { display: inline-block; padding: 0 6px; border-radius: 8px; background: #eee7d9; }
+      .pill.good { background: #d9efdf; color: var(--good); }
+      .pill.bad { background: #f6e0dc; color: var(--bad); }
+      #toast {
+        position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+        background: var(--ink); color: #fff; padding: 7px 14px; border-radius: 8px;
+        opacity: 0; transition: opacity 0.18s; pointer-events: none;
+      }
+      #toast.on { opacity: 1; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"><canvas id="map" width="1100" height="688"></canvas></div>
+    <aside id="panel">
+      <h1>River Lab <span class="pill bad">temporary</span></h1>
+      <p class="muted" style="margin: 0 0 12px">
+        给每条随机生成的河流打 1–5 分。分数写进 <code>shots/river-ratings.jsonl</code>，
+        攒够后用 <code>node tools/river-tune.mjs</code> 统计。
+        写点评语可选，会被一起存下来交给 AI 分析。
+      </p>
+
+      <div class="row">
+        <button class="rate" data-v="1">1</button>
+        <button class="rate" data-v="2">2</button>
+        <button class="rate" data-v="3">3</button>
+        <button class="rate" data-v="4">4</button>
+        <button class="rate" data-v="5">5</button>
+      </div>
+      <p class="muted" style="margin: 6px 0 0">
+        <kbd>1</kbd>–<kbd>5</kbd> rate &amp; next · <kbd>R</kbd> skip · <kbd>B</kbd> back
+      </p>
+
+      <h2>This river</h2>
+      <div id="meta" class="knobs"></div>
+      <div class="row" style="margin-top: 10px">
+        <button id="play">Play this set</button>
+        <button id="copy">Copy params</button>
+      </div>
+
+      <h2>Note (optional)</h2>
+      <textarea id="note" placeholder="e.g. the junction on the left looks pinched; too wide near the top"></textarea>
+      <p class="muted" style="margin: 6px 0 0">
+        Attached to the next rating. Whatever you write is stored with the score and printed by
+        <code>river-tune.mjs</code>, so it can be handed to an AI for diagnosis.
+      </p>
+
+      <h2>Progress</h2>
+      <div id="progress" class="muted">no ratings yet</div>
+      <div id="hist"></div>
+      <div class="row" style="margin-top: 8px">
+        <button id="export">Export JSON</button>
+        <button id="import">Import JSON</button>
+        <button id="wipe">Clear local</button>
+      </div>
+      <p class="muted" id="sync" style="margin: 8px 0 0"></p>
+
+      <h2>Recent notes</h2>
+      <div id="notes"><span class="muted">none</span></div>
+
+      <h2>Top seeds (&ge;4)</h2>
+      <div id="seeds"><span class="muted">none yet</span></div>
+    </aside>
+    <div id="toast"></div>
+    <div
+      id="crash"
+      style="display:none;position:fixed;inset:0;background:#fff;color:#c0503f;padding:24px;font:13px/1.6 ui-monospace,monospace;white-space:pre-wrap;overflow:auto;z-index:99"
+    ></div>
+    <script>
+      window.__labErrors = [];
+      const showCrash = (text) => {
+        window.__labErrors.push(String(text));
+        const el = document.getElementById('crash');
+        el.style.display = 'block';
+        el.textContent = 'River Lab failed:\n\n' + window.__labErrors.join('\n\n');
+        fetch('/report', {
+          method: 'POST',
+          body: JSON.stringify({ pass: 0, fail: 1, results: [{ name: 'river-lab', ok: false, detail: String(text) }] }),
+        }).catch(() => {});
+      };
+      window.addEventListener('error', (e) => showCrash((e.error && e.error.stack) || e.message));
+      window.addEventListener('unhandledrejection', (e) => showCrash((e.reason && e.reason.stack) || e.reason));
+    </script>
+
+    <script type="module">
+      import { River, RIVER_PARAMS, stretchOutline } from '../src/river.js';
+      import { Rng } from '../src/rng.js';
+      import { CONFIG } from '../src/config.js';
+
+      const canvas = document.getElementById('map');
+      const ctx = canvas.getContext('2d');
+      const W = CONFIG.world.w;
+      const H = CONFIG.world.h;
+      const KEY = 'minimetro.river-ratings';
+
+      // ?wipe=1 clears this browser's copy of the ratings, so a fresh round of
+      // training starts clean. The server's jsonl is not touched.
+      const wipeRequested = new URLSearchParams(location.search).has('wipe');
+      if (wipeRequested) {
+        try {
+          localStorage.removeItem(KEY);
+        } catch {
+          /* nothing to clear */
+        }
+        history.replaceState(null, '', location.pathname);
+      }
+
+      let ratings = [];
+      let current = null;
+      let history = [];
+      let pending = 0;
+      /** Ratings the server has actually acknowledged. */
+      let written = 0;
+
+      // ---------------------------------------------------------------- storage
+      function load() {
+        try {
+          ratings = JSON.parse(localStorage.getItem(KEY) || '[]');
+        } catch {
+          ratings = [];
+        }
+      }
+      function save() {
+        try {
+          localStorage.setItem(KEY, JSON.stringify(ratings));
+        } catch {
+          /* private mode: the server copy is the backup */
+        }
+      }
+      function sync(entries) {
+        pending += entries.length;
+        paintSync();
+        fetch('/ratings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ratings: entries }),
+        })
+          .then((r) => {
+            pending = Math.max(0, pending - entries.length);
+            if (r.ok) written += entries.length;
+            paintSync(r.ok ? '' : 'server refused the write (offline?) - kept locally');
+          })
+          .catch(() => {
+            pending = Math.max(0, pending - entries.length);
+            paintSync('offline: kept locally, use Export JSON to rescue');
+          });
+      }
+      function paintSync(extra) {
+        const el = document.getElementById('sync');
+        if (extra) {
+          el.textContent = extra;
+          return;
+        }
+        if (pending) {
+          el.textContent = pending + ' pending write...';
+          return;
+        }
+        if (!written) {
+          // The file does not exist until the first rating is written, so do
+          // not claim it is there.
+          el.textContent = 'no ratings written yet - shots/river-ratings.jsonl appears on your first rating';
+          return;
+        }
+        el.textContent = written + ' written to shots/river-ratings.jsonl';
+      }
+
+      // ----------------------------------------------------------------- render
+      function draw() {
+        const dpr = window.devicePixelRatio || 1;
+        const cssW = Math.max(320, Math.min(window.innerWidth - 400, 1150));
+        const cssH = Math.round(cssW * (H / W));
+        canvas.style.width = cssW + 'px';
+        canvas.style.height = cssH + 'px';
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+        const scale = canvas.width / W;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--paper');
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+
+        // Same construction as the game: tapered strokes, chunk by chunk.
+        const CHUNKS = 16;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--river');
+        for (const seg of current.river.segments) {
+          const pts = seg.points;
+          if (!pts || pts.length < 2) continue;
+          const n = pts.length;
+          for (let c = 0; c < CHUNKS; c++) {
+            const t0 = c / CHUNKS;
+            const t1 = (c + 1) / CHUNKS;
+            const i0 = Math.max(0, Math.floor(t0 * (n - 1)));
+            const i1 = Math.min(n - 1, Math.ceil(t1 * (n - 1)));
+            if (i1 <= i0) continue;
+            ctx.lineWidth = Math.max(1.5, seg.halfAt((t0 + t1) / 2) * 2);
+            ctx.beginPath();
+            ctx.moveTo(pts[i0].x, pts[i0].y);
+            for (let i = i0 + 1; i <= i1; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.stroke();
+          }
+        }
+      }
+
+      // --------------------------------------------------------------- generate
+      function randomKnobs() {
+        const out = {};
+        for (const [key, range] of Object.entries(RIVER_PARAMS)) {
+          out[key] = range[0] + Math.random() * (range[1] - range[0]);
+        }
+        return out;
+      }
+      function build(seed, knobs) {
+        const river = new River(new Rng(seed), CONFIG.world, knobs);
+        return { seed, knobs: river.knobs, river };
+      }
+      /** Islands in the river currently on screen. */
+      function islandCount() {
+        return current ? current.river.segments.filter((s) => s.kind === 'braid').length : 0;
+      }
+
+      function next(unrated = true) {
+        if (unrated && current) history.push(current);
+        if (history.length > 40) history.shift();
+        let guard = 0;
+        do {
+          current = build(Math.floor(Math.random() * 1e6), randomKnobs());
+        } while (islandCount() > MAX_ISLANDS && guard++ < 40);
+        // Anything above the cap is a reject by definition, so it is recorded
+        // as a 2 rather than shown and rated by hand.
+        if (islandCount() > MAX_ISLANDS) autoReject();
+        document.getElementById('note').value = '';
+        paint();
+      }
+
+      /** Record an over-islanded map as a 2 and move on. */
+      function autoReject() {
+        const entry = {
+          seed: current.seed,
+          knobs: current.knobs,
+          score: 2,
+          note: '自动：江心洲超过 ' + MAX_ISLANDS + ' 个',
+          at: new Date().toISOString(),
+        };
+        ratings.push(entry);
+        save();
+        sync([entry]);
+        paintProgress();
+        paintNotes();
+      }
+
+      /** ?seed=1234&knobs={...} re-opens one exact river. */
+      function openFromUrl() {
+        const q = new URLSearchParams(location.search);
+        const raw = q.get('seed');
+        if (!raw) return false;
+        let knobs = null;
+        try {
+          knobs = q.get('knobs') ? JSON.parse(q.get('knobs')) : null;
+        } catch {
+          knobs = null;
+        }
+        current = build(Number(raw) || 0, knobs || randomKnobs());
+        document.getElementById('note').value = '';
+        paint();
+        return true;
+      }
+      function back() {
+        if (!history.length) return;
+        current = history.pop();
+        document.getElementById('note').value = '';
+        paint();
+      }
+
+      // ------------------------------------------------------------------ paint
+      function knobRows(knobs) {
+        const rows = [];
+        for (const [key, range] of Object.entries(RIVER_PARAMS)) {
+          const v = knobs[key];
+          const t = Math.max(0, Math.min(1, (v - range[0]) / (range[1] - range[0])));
+          rows.push(
+            '<div>' + key + '</div><div><b>' + v.toFixed(2) +
+              '</b><div class="bar"><i style="width:' + (t * 100).toFixed(0) + '%"></i></div></div>',
+          );
+        }
+        return rows.join('');
+      }
+      function paint() {
+        draw();
+        const segs = current.river.segments;
+        const kinds = segs.map((s) => s.kind[0]).join('');
+        const widths = segs.map((s) => s.w0.toFixed(0) + '-' + s.w1.toFixed(0)).join(', ');
+        document.getElementById('meta').innerHTML =
+          '<div>seed</div><div><b>' + current.seed + '</b></div>' +
+          '<div>stretches</div><div><b>' + segs.length + '</b> (' + (kinds || '-') + ')</div>' +
+          '<div>width px</div><div><b>' + widths + '</b></div>' +
+          knobRows(current.knobs);
+        paintProgress();
+        paintNotes();
+      }
+
+      function paintProgress() {
+        const el = document.getElementById('progress');
+        if (!ratings.length) {
+          el.textContent = 'no ratings yet';
+          document.getElementById('hist').innerHTML = '';
+          document.getElementById('seeds').innerHTML = '<span class="muted">none yet</span>';
+          return;
+        }
+        const sum = ratings.reduce((n, r) => n + r.score, 0);
+        const good = ratings.filter((r) => r.score >= 4).length;
+        el.innerHTML =
+          '<b>' + ratings.length + '</b> ratings · mean <b>' + (sum / ratings.length).toFixed(2) +
+          '</b> · &ge;4: <b>' + good + '</b> (' + ((good / ratings.length) * 100).toFixed(0) + '%)';
+        const counts = [0, 0, 0, 0, 0];
+        for (const r of ratings) counts[r.score - 1]++;
+        const max = Math.max(1, ...counts);
+        document.getElementById('hist').innerHTML = counts
+          .map((c, i) => '<div style="height:' + ((c / max) * 100) + '%"><span>' + (c || '') + '</span></div>')
+          .join('');
+        const best = ratings.filter((r) => r.score >= 4).slice(-40).reverse();
+        document.getElementById('seeds').innerHTML = best.length
+          ? best.map((r) => '<div><span class="pill good">' + r.score + '</span> seed ' + r.seed + '</div>').join('')
+          : '<span class="muted">none yet</span>';
+      }
+
+      function paintNotes() {
+        const withNotes = ratings.filter((r) => r.note && r.note.trim()).slice(-12).reverse();
+        const el = document.getElementById('notes');
+        el.innerHTML = withNotes.length
+          ? withNotes
+              .map((r) => {
+                const cls = r.score >= 4 ? 'good' : 'bad';
+                return '<div><span class="pill ' + cls + '">' + r.score + '</span> ' +
+                  '<i>seed ' + r.seed + '</i> — ' + escapeHtml(r.note) + '</div>';
+              })
+              .join('')
+          : '<span class="muted">none</span>';
+      }
+
+      function escapeHtml(text) {
+        const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+        return String(text).replace(/[&<>"]/g, (c) => map[c]);
+      }
+
+      // ------------------------------------------------------------------- rate
+      /** The most islands a map is allowed to have before it is a reject. */
+      const MAX_ISLANDS = 3;
+
+      function rate(score) {
+        const note = document.getElementById('note').value.trim();
+        const entry = {
+          seed: current.seed,
+          knobs: current.knobs,
+          score,
+          note: note || '',
+          at: new Date().toISOString(),
+        };
+        ratings.push(entry);
+        save();
+        sync([entry]);
+        paintProgress();
+        paintNotes();
+        toast(score >= 4 ? 'rated ' + score + ' · good' : score <= 2 ? 'rated ' + score + ' · bad' : 'rated ' + score);
+        next();
+      }
+
+      let toastTimer = 0;
+      function toast(text) {
+        const el = document.getElementById('toast');
+        el.textContent = text;
+        el.classList.add('on');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => el.classList.remove('on'), 1100);
+      }
+
+      // ------------------------------------------------------------------ wiring
+      for (const b of document.querySelectorAll('button.rate')) {
+        b.addEventListener('click', () => rate(Number(b.dataset.v)));
+      }
+      document.getElementById('play').addEventListener('click', () => {
+        const url =
+          '/?autostart=1&seed=' + current.seed + '&river=' + encodeURIComponent(JSON.stringify(current.knobs));
+        window.open(url, '_blank');
+      });
+      document.getElementById('copy').addEventListener('click', async () => {
+        await navigator.clipboard.writeText(JSON.stringify(current.knobs));
+        toast('params copied');
+      });
+      document.getElementById('export').addEventListener('click', () => {
+        const blob = new Blob([JSON.stringify(ratings, null, 1)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'river-ratings.json';
+        a.click();
+        toast('exported');
+      });
+      document.getElementById('import').addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json';
+        input.onchange = async () => {
+          const text = await input.files[0].text();
+          try {
+            const data = JSON.parse(text);
+            if (!Array.isArray(data)) throw new Error('not a list');
+            ratings = ratings.concat(data);
+            save();
+            sync(data);
+            paintProgress();
+            paintNotes();
+            toast('imported ' + data.length);
+          } catch (error) {
+            toast('import failed: ' + error.message);
+          }
+        };
+        input.click();
+      });
+      document.getElementById('wipe').addEventListener('click', () => {
+        if (!confirm('Clear the LOCAL ratings? (the server copy stays)')) return;
+        ratings = [];
+        save();
+        paintProgress();
+        paintNotes();
+      });
+      window.addEventListener('keydown', (e) => {
+        const tag = e.target && e.target.tagName;
+        if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+        if (e.key >= '1' && e.key <= '5') rate(Number(e.key));
+        else if (e.key === 'r' || e.key === 'R') next();
+        else if (e.key === 'b' || e.key === 'B') back();
+      });
+      window.addEventListener('resize', () => current && draw());
+
+      load();
+      if (!openFromUrl()) next(false);
+      paintSync();
+      if (wipeRequested) {
+        toast('本机评分已清空（服务器存档未动）');
+      }
+      fetch('/ratings')
+        .then((r) => (r.ok ? r.json() : []))
+        .then((all) => {
+          if (Array.isArray(all) && all.length > ratings.length) {
+            console.log('[river-lab] server has ' + all.length + ' ratings, local ' + ratings.length + '. Use Import JSON to merge.');
+          }
+        })
+        .catch(() => {});
+    </script>
+  </body>
+</html>

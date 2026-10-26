@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Mini Metro · 复刻版</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="map"></canvas>
+
+      <div id="hud">
+        <div class="panel hud-topleft">
+          <div class="stat">
+            <b id="stat-delivered">0</b>
+            <span>已送达</span>
+          </div>
+          <div class="stat sub">
+            <b id="stat-score">0</b>
+            <span>得分</span>
+          </div>
+          <div class="clock" id="stat-clock">周一 · 第 1 周</div>
+        </div>
+
+        <div class="panel hud-topright">
+          <div class="speeds" id="speeds">
+            <button data-speed="0" title="暂停 / 继续">❚❚</button>
+            <button data-speed="1" class="on" title="正常速度">1×</button>
+            <button data-speed="2" title="二倍速">2×</button>
+            <button data-speed="3" title="三倍速">3×</button>
+          </div>
+          <button class="ghost" id="btn-restart">重新开始</button>
+        </div>
+
+        <div class="hud-bottomleft">
+          <div class="tray-label">线路</div>
+          <div class="tray" id="lines"></div>
+        </div>
+
+        <div class="hud-bottomright">
+          <div class="tray-label">资源</div>
+          <div class="tray" id="inventory"></div>
+        </div>
+
+        <div class="hint" id="hint">
+          拖线路两端的 T 延长线路 · 从车站本身拖出＝开新线 · 拖线路中段可改道 · 右键车站可摘除
+        </div>
+        <div class="panel board hidden" id="board">
+          <div class="board-title">联机竞速 · 活得最久者胜</div>
+          <ol class="roster" id="board-list"></ol>
+        </div>
+        <div class="toasts" id="toasts"></div>
+      </div>
+
+      <div class="overlay" id="overlay-start">
+        <div class="card start-card">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <div>
+              <h1>Mini Metro</h1>
+              <p class="tagline">城市地铁规划 · 复刻版</p>
+            </div>
+          </div>
+          <p class="tagline">把乘客送到他们想去的车站</p>
+          <div class="modes" id="modes">
+            <button class="mode" data-mode="normal">
+              <b>普通模式</b>
+              <span>站台超载倒计时归零即结束</span>
+            </button>
+            <button class="mode" data-mode="endless">
+              <b>无尽模式</b>
+              <span>超载只会清空站台并扣分</span>
+            </button>
+          </div>
+          <button class="ghost wide" id="btn-online">联机模式 · 同图竞速</button>
+          <button class="ghost wide" id="btn-rules">规则说明</button>
+        </div>
+      </div>
+
+      <div class="overlay hidden" id="overlay-lobby">
+        <div class="card">
+          <div class="rules-head">
+            <h2>联机 · 同图竞速</h2>
+            <button class="ghost" id="btn-lobby-back">返回</button>
+          </div>
+          <p class="blurb small">
+            所有人跑<b>同一张地图</b>，各自修各自的网，<b>活得最久的人赢</b>。
+            由一台电脑当主机（<code>node tools/net-server.mjs</code>），其他人在局域网里打开它给出的地址。
+          </p>
+          <div class="row" id="lobby-choice">
+            <button class="primary" id="btn-host">创建房间</button>
+            <input id="lobby-code" maxlength="4" placeholder="房间号" autocomplete="off" />
+            <button class="ghost" id="btn-join">加入</button>
+          </div>
+          <p class="blurb small" id="lobby-hint"></p>
+          <div id="lobby-room" class="hidden">
+            <div class="room-code">房间号 <b id="lobby-room-code">----</b></div>
+            <ul class="roster" id="lobby-roster"></ul>
+            <div class="row">
+              <button class="primary" id="btn-lobby-start">开始比赛</button>
+              <button class="ghost" id="btn-lobby-leave">离开房间</button>
+            </div>
+            <p class="blurb small" id="lobby-wait"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="overlay hidden" id="overlay-results">
+        <div class="card">
+          <h2 id="results-title">比赛结束</h2>
+          <p class="blurb" id="results-line"></p>
+          <ol class="roster big" id="results-list"></ol>
+          <div class="row">
+            <button class="primary" id="btn-results-again">再来一局</button>
+            <button class="ghost" id="btn-results-menu">回到主菜单</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="overlay hidden" id="overlay-rules">
+        <div class="card rules-card">
+          <div class="rules-head">
+            <h2>规则说明</h2>
+            <button class="ghost" id="btn-rules-back">返回</button>
+          </div>
+          <div class="rules-body" id="rules-body"></div>
+        </div>
+      </div>
+
+      <div class="overlay hidden" id="overlay-upgrade">
+        <div class="card">
+          <h2>第 <span id="upgrade-week">1</span> 周 · 选择一项奖励</h2>
+          <p class="blurb small">每周只能选一样，想清楚再拿。</p>
+          <div class="rewards" id="rewards"></div>
+        </div>
+      </div>
+
+      <div class="overlay hidden" id="overlay-gameover">
+        <div class="card">
+          <h2 id="gameover-title">线路瘫痪了</h2>
+          <p class="blurb" id="gameover-reason"></p>
+          <div class="summary" id="gameover-summary"></div>
+          <div class="row">
+            <button class="primary" id="btn-again">再来一局</button>
+            <button class="ghost" id="btn-menu">回到主菜单</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

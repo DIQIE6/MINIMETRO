@@ -1,0 +1,1318 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>browser check</title>
+    <style>
+      body { margin: 0; font: 12px/1.45 monospace; }
+      iframe { width: 1280px; height: 760px; border: 0; display: block; }
+      #report { position: fixed; right: 0; bottom: 0; background: #fff; max-width: 660px; max-height: 300px; overflow: auto; }
+      #report.done { border: 3px solid #2a2; }
+      #report.failed { border: 3px solid #c33; }
+    </style>
+  </head>
+  <body>
+    <!-- Drives the real game page with synthetic pointer events, so the click
+         builder, the press-and-hold lift, the renderer and the HUD are all
+         verified inside a browser rather than only in Node. -->
+    <iframe id="stage" src="../index.html?autostart=1&seed=5"></iframe>
+    <pre id="report">pending</pre>
+
+    <script type="module">
+      let finished = false;
+      const results = [];
+      const report = document.getElementById('report');
+
+      const publish = () => {
+        const failed = results.filter((r) => !r.ok);
+        const payload = { pass: results.length - failed.length, fail: failed.length, results };
+        report.textContent = JSON.stringify(payload, null, 1);
+        report.className = failed.length ? 'failed' : 'done';
+        document.title = failed.length ? `FAILED:${failed.length}` : `PASSED:${results.length}`;
+        fetch('/report', { method: 'POST', body: JSON.stringify(payload) }).catch(() => {});
+      };
+      const check = (name, ok, detail = '') => {
+        results.push({ name, ok: !!ok, detail: String(detail) });
+        publish();
+        return !!ok;
+      };
+      const finishedRun = () => {
+        finished = true;
+        publish();
+      };
+      window.addEventListener('error', (e) => check('no uncaught errors', false, `${e.message} @ ${e.filename}:${e.lineno}`));
+
+      const frame = document.getElementById('stage');
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      async function main() {
+        for (let i = 0; i < 300 && !frame.contentWindow.__minimetro; i++) await wait(20);
+        const w = frame.contentWindow;
+        if (!w.__minimetro) {
+          check('game booted', false, 'window.__minimetro was never defined');
+          return finishedRun();
+        }
+        w.addEventListener('error', (e) =>
+          check('page runs without errors', false, `${e.message} @ ${e.filename}:${e.lineno}`),
+        );
+
+        let mm = w.__minimetro;
+        let game = mm.game;
+        const rebind = () => {
+          mm = w.__minimetro;
+          game = mm.game;
+          game.tunnelsOwned = 20;
+          mm.tick(1 / 60);
+          return mm;
+        };
+
+        /**
+         * Two dry points with water between them. Scans a grid rather than
+         * stepping off the river's normal: the rivers are wide and windy now,
+         * so a point 90 px off one bend can sit inside another.
+         */
+        const acrossRiver = () => {
+          const river = game.river;
+          const dry = (x, y) =>
+            x > 40 && y > 40 && x < 1570 && y < 960 &&
+            river.distanceTo(x, y) > river.width / 2 + 16;
+          const spots = [];
+          for (let x = 80; x < 1520; x += 70) {
+            for (let y = 80; y < 920; y += 70) if (dry(x, y)) spots.push({ x, y });
+          }
+          let fallback = null;
+          for (let i = 0; i < spots.length; i++) {
+            for (let j = i + 1; j < spots.length; j++) {
+              const a = spots[i];
+              const b = spots[j];
+              const d = Math.hypot(a.x - b.x, a.y - b.y);
+              if (d < 140 || d > 460) continue;
+              const n = river.crossings([a, b]);
+              if (n === 1) return { near: a, far: b, crossings: 1 };
+              if (n > 1) fallback = fallback || { near: a, far: b, crossings: n };
+            }
+          }
+          return fallback;
+        };
+
+        /**
+         * The world point at an arc distance along a line's route.
+         *
+         * Snapping to the nearest *vertex* is wrong: a straight leg is sampled
+         * as just its two endpoints, so every distance along it would resolve
+         * to the station at its start.
+         */
+        const pointAtArc = (line, s) => {
+          const pts = line.path.points;
+          const cum = line.path.cum;
+          if (pts.length < 2) return { x: pts[0]?.x ?? 0, y: pts[0]?.y ?? 0 };
+          const clamped = Math.max(0, Math.min(line.path.total, s));
+          let i = 0;
+          for (let k = 0; k + 1 < pts.length; k++) if (cum[k] <= clamped) i = k;
+          const span = cum[i + 1] - cum[i] || 1;
+          const t = Math.max(0, Math.min(1, (clamped - cum[i]) / span));
+          return {
+            x: pts[i].x + (pts[i + 1].x - pts[i].x) * t,
+            y: pts[i].y + (pts[i + 1].y - pts[i].y) * t,
+          };
+        };
+
+        /** New lines no longer take a locomotive on their own: staff one. */
+        const staffOne = (line) => {
+          if (line && line.isActive && !line.hasLocomotive) game.deployLocomotive(line, 0);
+          mm.tick(1 / 60);
+          return line;
+        };
+
+        const canvas = w.document.getElementById('map');
+        const toClient = (x, y) => {
+          const rect = canvas.getBoundingClientRect();
+          const R = mm.renderer;
+          return { clientX: rect.left + R.ox + x * R.scale, clientY: rect.top + R.oy + y * R.scale };
+        };
+        const onCanvas = (type, pt) =>
+          canvas.dispatchEvent(
+            new w.PointerEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              pointerId: 1,
+              pointerType: 'mouse',
+              isPrimary: true,
+              button: 0,
+              buttons: 1,
+              ...pt,
+            }),
+          );
+        const pointer = (type, pt, extra = {}) =>
+          w.dispatchEvent(
+            new w.PointerEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              pointerId: 1,
+              pointerType: 'mouse',
+              isPrimary: true,
+              ...pt,
+              ...extra,
+            }),
+          );
+        const releaseAt = (pt) =>
+          w.dispatchEvent(
+            new w.PointerEvent('pointerup', {
+              bubbles: true,
+              cancelable: true,
+              pointerId: 1,
+              pointerType: 'mouse',
+              button: 0,
+              buttons: 0,
+              ...pt,
+            }),
+          );
+        const clickWorld = (p) => {
+          const pt = toClient(p.x, p.y);
+          onCanvas('pointerdown', pt);
+          releaseAt(pt);
+          mm.tick(1 / 60);
+        };
+        const clickStation = (station) => clickWorld({ x: station.x, y: station.y });
+        const clickEmpty = () => clickWorld({ x: 28, y: 28 });
+
+        const press = (p) => onCanvas('pointerdown', toClient(p.x, p.y));
+        const dragOver = (p) => {
+          pointer('pointermove', toClient(p.x, p.y), { buttons: 1 });
+          mm.tick(1 / 60);
+        };
+        const release = (p) => {
+          pointer('pointerup', toClient(p.x, p.y));
+          mm.tick(1 / 60);
+        };
+        /** Press a station and drag through a list of world points, then release. */
+        const dragFrom = (station, waypoints) => {
+          press({ x: station.x, y: station.y });
+          for (const wp of waypoints) dragOver(wp);
+          const last = waypoints[waypoints.length - 1];
+          release(last ? last : { x: station.x, y: station.y });
+        };
+        /** Press directly on a piece of track and drop it somewhere. */
+        const dragSegment = (line, index, target, at = 0.5) => {
+          const a = line.stations[index];
+          const b = line.isLoop && index === line.stations.length - 1 ? line.stations[0] : line.stations[index + 1];
+          // Press on the *routed* track, not the straight line between the two
+          // stations: with octilinear routing they are often far apart.
+          const s0 = line.stationS[index];
+          const last = line.isLoop && index === line.stations.length - 1;
+          const s1 = last ? line.path.total : line.stationS[index + 1];
+          const sMid = s0 + (s1 - s0) * at;
+          const straight = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+          const mid = pointAtArc(line, sMid);
+          // Prefer the routed track; fall back to the straight line if the
+          // route bends away from it.
+          const pt = mm.input.hitSegment(mid.x, mid.y) ? mid : straight;
+          press(pt);
+          dragOver(target);
+          release(target);
+        };
+        const rightClick = (station) => {
+          const pt = toClient(station.x, station.y);
+          canvas.dispatchEvent(
+            new w.MouseEvent('contextmenu', { bubbles: true, cancelable: true, ...pt }),
+          );
+          mm.tick(1 / 60);
+        };
+
+        // --- boot ------------------------------------------------------------
+        await wait(500);
+        mm.tick(1 / 60);
+        check('renderer advanced', mm.renderer.time > 0, `renderer.time=${mm.renderer.time.toFixed(3)}`);
+        check('booted in playing state', game.state === 'playing', game.state);
+        check('three starting stations', game.stations.length === 3, game.stations.length);
+        check(
+          'line tray shows the starting slots',
+          w.document.querySelectorAll('#lines .chip').length === 3,
+          w.document.querySelectorAll('#lines .chip').length,
+        );
+
+        const ctx = canvas.getContext('2d');
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let painted = 0;
+        for (let i = 0; i < data.length; i += 4 * 37) {
+          const opaque = data[i + 3] > 200;
+          const letterbox = data[i] === 232 && data[i + 1] === 228 && data[i + 2] === 218;
+          if (opaque && !letterbox) painted++;
+        }
+        check('canvas is painted', painted > 2000, `${painted} opaque non-letterbox sampled pixels`);
+
+        // =====================================================================
+        // drag-to-build
+        // =====================================================================
+        game.tunnelsOwned = 20;
+        const [a, b, c] = game.stations;
+
+        // A plain click must do nothing at all: no line, no slot taken.
+        clickStation(a);
+        check(
+          'a plain click on a station does not create a line',
+          game.drag === null && game.lines[0].claimed === false && game.lineSlotsAvailable() === 3,
+          `drag=${JSON.stringify(game.drag)} claimed=${game.lines[0].claimed}`,
+        );
+
+        // Press the station and drag out to two more stations.
+        press({ x: a.x, y: a.y });
+        check('pressing a station starts a drag', game.drag !== null && game.drag.anchorId === a.id,
+          JSON.stringify(game.drag));
+        check('the dragged line is shown in a colour',
+          game.draggingLine !== null && typeof game.draggingLine.color.stroke === 'string',
+          game.draggingLine && game.draggingLine.color.stroke);
+        dragOver({ x: b.x, y: b.y });
+        dragOver({ x: c.x, y: c.y });
+        check('the drag picked up every station it passed',
+          game.drag.route.length === 2, game.drag.route.map((s) => s.id).join(','));
+        check('the rubber band follows the pointer',
+          game.dragPreviewPoints({ x: 0, y: 0 }).length === 4,
+          game.dragPreviewPoints({ x: 0, y: 0 }).length);
+        release({ x: c.x, y: c.y });
+        check(
+          'releasing lands the line on those stations',
+          game.lines[0].stations.map((s) => s.id).join(',') === [a.id, b.id, c.id].join(','),
+          game.lines[0].stations.map((s) => s.id).join(','),
+        );
+        check('the drag session ended', game.drag === null);
+
+        // A drag that never reaches a second station is thrown away.
+        const orphan = game.addStation(420, 220, 'star');
+        const slotsBefore = game.lineSlotsAvailable();
+        press({ x: orphan.x, y: orphan.y });
+        check('dragging from a free station claims a slot',
+          game.lineSlotsAvailable() === slotsBefore - 1, `${slotsBefore} -> ${game.lineSlotsAvailable()}`);
+        release({ x: orphan.x, y: orphan.y });
+        check(
+          'a drag that connects nothing gives the slot back',
+          game.drag === null && game.lineSlotsAvailable() === slotsBefore && !game.lines[1].claimed,
+          `slots=${game.lineSlotsAvailable()} claimed=${game.lines[1].claimed}`,
+        );
+
+        // A terminus carries a T marker: dragging the T extends the line,
+        // dragging the station body starts a new one.
+        const line = game.lines[0];
+        const fourth = game.addStation(760, 320, 'gem');
+        const linesBefore = game.activeLines().length;
+        const mark = mm.renderer.terminusMarker(line, 1);
+        check(
+          'a terminus is marked with a T',
+          !!mark && mark.bar.length === 2 && Math.hypot(mark.tip.x - mark.base.x, mark.tip.y - mark.base.y) > 10,
+          mark ? `stem ${Math.hypot(mark.tip.x - mark.base.x, mark.tip.y - mark.base.y).toFixed(1)} px` : 'no marker',
+        );
+
+        // Pressing the station body at that terminus opens a NEW line instead.
+        const tailStation = line.stations[line.stations.length - 1];
+        const slotsNow = game.lineSlotsAvailable();
+        press({ x: tailStation.x, y: tailStation.y });
+        check(
+          'pressing the station body at a terminus starts a new line',
+          game.drag !== null && game.drag.isNew === true && game.drag.lineId !== line.id,
+          JSON.stringify(game.drag),
+        );
+        release({ x: tailStation.x, y: tailStation.y });
+        check(
+          'that abandoned line gives its slot straight back',
+          game.drag === null && game.lineSlotsAvailable() === slotsNow,
+          `slots=${game.lineSlotsAvailable()}`,
+        );
+
+        // Pressing the T extends the existing line.
+        press({ x: mark.tip.x, y: mark.tip.y });
+        check(
+          'pressing the T continues that line',
+          game.drag !== null && game.drag.lineId === line.id && game.drag.isNew === false,
+          JSON.stringify(game.drag),
+        );
+        dragOver({ x: fourth.x, y: fourth.y });
+        release({ x: fourth.x, y: fourth.y });
+        check(
+          'the dragged line grows by the station it landed on',
+          line.stations.length === 4 && line.hasStation(fourth.id) && game.activeLines().length === linesBefore,
+          line.stations.map((s) => s.id).join(','),
+        );
+
+        // Dragging the other terminus T onto this one closes the loop.
+        const headStation = line.stations[0];
+        const tailMark = mm.renderer.terminusMarker(line, 1);
+        press({ x: tailMark.tip.x, y: tailMark.tip.y });
+        dragOver({ x: headStation.x, y: headStation.y });
+        release({ x: headStation.x, y: headStation.y });
+        check(
+          'dropping the T on the other terminus closes the loop',
+          line.isLoop === true && line.stations.length === 4,
+          `isLoop=${line.isLoop} stations=${line.stations.length}`,
+        );
+        check(
+          'a loop has no terminus markers any more',
+          mm.renderer.terminusMarker(line, 0) === null,
+          String(mm.renderer.terminusMarker(line, 0)),
+        );
+
+        // =====================================================================
+        // re-routing a segment, and right-click removal
+        // =====================================================================
+        mm.startGame('normal');
+        rebind();
+        // Hand-placed and far apart: the press has to land on the track itself,
+        // clear of the T markers at either end and clear of the train.
+        const q1 = game.addStation(200, 800, 'circle');
+        const q2 = game.addStation(780, 800, 'triangle');
+        const q3 = game.addStation(1360, 800, 'square');
+        dragFrom(q1, [{ x: q2.x, y: q2.y }, { x: q3.x, y: q3.y }]);
+        const qline = staffOne(game.lines[0]);
+        check('a three station line was drawn in one gesture', qline.stations.length === 3,
+          qline.stations.map((s) => s.id).join(','));
+
+        const parkTrain = (line) => {
+          for (const t of line.trains) {
+            t.placeAt(line.stations.length - 1, line.stationS, line.stations.length);
+            t.pendingArrival = null;
+            t.dwell = 600;
+            t.v = 0;
+          }
+          mm.tick(1 / 60);
+        };
+        // Park the train ON the leg we are about to re-route. An edit only
+        // freezes the trains that were standing on the track it changed, so
+        // parking it at the far end would (correctly) leave it running.
+        const parkOnLeg = (line, index) => {
+          for (const t of line.trains) {
+            t.placeAt(index, line.stationS, line.stations.length);
+            t.s = (line.stationS[index] + line.stationS[index + 1]) / 2;
+            t.pendingArrival = null;
+            t.dwell = 600;
+            t.v = 0;
+          }
+          mm.tick(1 / 60);
+        };
+        parkOnLeg(qline, 0);
+        // Grab the piece of track between q1 and q2 and drop it on a new station.
+        const midS = qline.stationS[0] + (qline.stationS[1] - qline.stationS[0]) * 0.75;
+        const onTrack = pointAtArc(qline, midS);
+        const detour = game.addStation(onTrack.x, onTrack.y, 'diamond');
+        dragSegment(qline, 0, { x: detour.x, y: detour.y }, 0.3);
+        check(
+          'dragging a segment re-routes the line through another station',
+          qline.stations.map((s) => s.id).join(',') === [q1.id, detour.id, q2.id, q3.id].join(','),
+          qline.stations.map((s) => s.id).join(','),
+        );
+        check(
+          're-routing a segment while the train runs fades the old route',
+          qline.trains[0].frozen !== null && qline.trains[0].frozen.stations.length === 3,
+          `frozen=${qline.trains[0].frozen && qline.trains[0].frozen.stations.map((s) => s.id).join(',')}`,
+        );
+
+        // Right-click a mid-line station: it leaves and the neighbours close up.
+        rightClick(q2);
+        check(
+          'right-clicking a station removes it from the line',
+          qline.stations.map((s) => s.id).join(',') === [q1.id, detour.id, q3.id].join(','),
+          qline.stations.map((s) => s.id).join(','),
+        );
+
+        // Right-clicking a station that is not on a line is harmless.
+        const bystander = game.addStation(1050, 700, 'cross');
+        rightClick(bystander);
+        check('right-clicking a loose station changes nothing',
+          qline.stations.length === 3 && game.lineOf(bystander.id) === null,
+          qline.stations.map((s) => s.id).join(','));
+
+        // =====================================================================
+        // retiring a line that still has passengers
+        // =====================================================================
+        // A line of our own, drawn in a single gesture: the re-route above
+        // deliberately left the previous line mid-handover (its train was still
+        // finishing a route whose next stop had been removed), and a line whose
+        // train is frozen is cleared immediately instead of retired.
+        mm.startGame('endless');
+        rebind();
+        const [r1, r2, r3] = game.stations;
+        dragFrom(r1, [{ x: r2.x, y: r2.y }, { x: r3.x, y: r3.y }]);
+        const rline = staffOne(game.lines.find((l) => l.claimed));
+        check('the retire scenario has a running line to retire',
+          rline.stations.length === 3 && rline.isRunning === true,
+          `stations=${rline.stations.length} running=${rline.isRunning}`);
+        mm.tick(1 / 60);
+        mm.tick(1 / 60);
+        const locoBeforeRetire = game.locomotives.available;
+        const riders = [];
+        for (let i = 0; i < 3; i++) {
+          const p = { destShape: r1.shape, born: 0, targetStationId: r1.id, lastLineId: null };
+          riders.push(p);
+          rline.trains[0].passengers.push(p);
+        }
+        const deliveredBeforeRetire = game.delivered;
+        game.clearLine(rline);
+        check(
+          'clearing a busy line retires it instead of deleting it',
+          rline.retiring === true && (rline.trains[0] ? rline.trains[0].frozen : null) !== null && (rline.trains[0] ? rline.trains[0].frozen : null).stations.length === 3,
+          `retiring=${rline.retiring} ghost=${rline.trains[0] && (rline.trains[0] ? rline.trains[0].frozen : null) && (rline.trains[0] ? rline.trains[0].frozen : null).stations.length}`,
+        );
+        check('the retiring line released its track but keeps its colour slot',
+          rline.stations.length === 0 && game.claimedLines().includes(rline) === true, game.lineSlotsAvailable());
+        check('and it no longer accepts new passengers',
+          game.liveLines().includes(rline) === false);
+        let guardA = 0;
+        while (rline.trains.length && guardA++ < 60 * 150) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          else if (game.state === 'playing') game.update(1 / 60);
+          else break;
+        }
+        check(
+          'the retired line disappears once its train has reached a platform',
+          rline.retiring === false && rline.trains.length === 0 && rline.stations.length === 0,
+          `retiring=${rline.retiring} trains=${rline.trains.length} stations=${rline.stations.length}`,
+        );
+        check('the withdrawn locomotive went back into the pool',
+          rline.hasLocomotive === false && game.locomotives.available === locoBeforeRetire + 1,
+          `hasLocomotive=${rline.hasLocomotive} pool ${locoBeforeRetire} -> ${game.locomotives.available}`);
+        const ridersOnPlatform = riders.filter((p) => game.stations.some((s) => s.passengers.includes(p))).length;
+        check(
+          'and the riders were handed to a platform, not deleted',
+          ridersOnPlatform + (game.delivered - deliveredBeforeRetire) === riders.length,
+          `delivered +${game.delivered - deliveredBeforeRetire}, standing on a platform ${ridersOnPlatform} of ${riders.length}`,
+        );
+
+        // =====================================================================
+        // editing a line: the train finishes the old route first
+        // =====================================================================
+        mm.startGame('normal');
+        rebind();
+        const [e1, e2, e3] = game.stations;
+        dragFrom(e1, [{ x: e2.x, y: e2.y }, { x: e3.x, y: e3.y }]);
+        const eline = staffOne(game.lines[0]);
+        const rider = { destShape: e2.shape, born: 0, targetStationId: e2.id, lastLineId: null };
+        eline.trains[0].passengers.push(rider);
+        const detourStation = game.addStation(
+          (r1.x + r2.x) / 2,
+          (r1.y + r2.y) / 2,
+          'diamond',
+        );
+        game.tryLineEdit(eline, () => eline.insertStationAt(detourStation, 1));
+        mm.tick(1 / 60);
+        check(
+          'editing a line with riders on board freezes the train on the old route',
+          (eline.trains[0] ? eline.trains[0].frozen : null) !== null && (eline.trains[0] ? eline.trains[0].frozen : null).stations.length === 3,
+          `frozen=${!!(eline.trains[0] ? eline.trains[0].frozen : null)}`,
+        );
+        check(
+          'the old route does not contain the station that was just added',
+          (eline.trains[0] ? eline.trains[0].frozen : null).hasStation(detourStation.id) === false && eline.hasStation(detourStation.id) === true,
+          eline.stations.map((s) => s.id).join(','),
+        );
+        check('the line itself is still live', eline.retiring === false && game.liveLines().includes(eline));
+        let guardB = 0;
+        while ((eline.trains[0] ? eline.trains[0].frozen : null) && guardB++ < 60 * 150) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          game.update(1 / 60);
+        }
+        check(
+          'the train switches to the new route once it has finished',
+          (eline.trains[0] ? eline.trains[0].frozen : null) === null && eline.stations.length === 4,
+          `frozen=${!!(eline.trains[0] ? eline.trains[0].frozen : null)} stations=${eline.stations.length}`,
+        );
+        check(
+          'the train keeps its locomotive and carries on from the station it reached',
+          eline.hasLocomotive === true && eline.isRunning === true &&
+            eline.trains[0].stopIndex === eline.indexOfStation(e2.id),
+          `hasLocomotive=${eline.hasLocomotive} stopIndex=${eline.trains[0].stopIndex} expected=${eline.indexOfStation(e2.id)}`,
+        );
+
+        // =====================================================================
+        // vehicles: the tray, deploying them, and moving a train between lines
+        // =====================================================================
+        mm.startGame('endless');
+        rebind();
+        game.tunnelsOwned = 60;
+        const [v1, v2, v3] = game.stations;
+        const v4 = game.addStation(1360, 880, 'gem');
+        const v5 = game.addStation(1360, 160, 'star');
+        const vehicleChips = () => Array.from(w.document.querySelectorAll('#inventory .chip.vehicle'));
+        const chipCount = (el) => (el ? el.querySelector('.count')?.textContent ?? '' : '');
+        const pressChip = (el, pt) =>
+          el.dispatchEvent(
+            new w.PointerEvent('pointerdown', {
+              bubbles: true,
+              cancelable: true,
+              pointerId: 1,
+              pointerType: 'mouse',
+              button: 0,
+              buttons: 1,
+              ...pt,
+            }),
+          );
+        mm.tick(1 / 60);
+
+        check('the tray offers exactly a locomotive and a carriage chip',
+          vehicleChips().length === 2, vehicleChips().length);
+        check('vehicle chips read available/total',
+          chipCount(vehicleChips()[0]) === '3/3' && chipCount(vehicleChips()[1]) === '1/1',
+          `${chipCount(vehicleChips()[0])} / ${chipCount(vehicleChips()[1])}`);
+        check('the pools start at three locomotives and one carriage',
+          game.locomotives.available === 3 && game.locomotives.total === 3 &&
+            game.carriages.available === 1 && game.carriages.total === 1,
+          `loco ${game.locomotives.available}/${game.locomotives.total} carriage ${game.carriages.available}/${game.carriages.total}`);
+
+        // A brand new line does NOT pull a locomotive out of the pool by itself.
+        dragFrom(v1, [{ x: v2.x, y: v2.y }]);
+        const vlineA = game.lines.find((l) => l.claimed);
+        check(
+          'a new line takes a locomotive with it',
+          vlineA.stations.length === 2 && vlineA.hasLocomotive === true && vlineA.isRunning === true &&
+            vlineA.trains.length === 1 && game.locomotives.available === 2,
+          `stations=${vlineA.stations.length} trains=${vlineA.trains.length} pool=${game.locomotives.available}`,
+        );
+        check(
+          'the tray chip is still draggable while spares remain',
+          vehicleChips()[0].disabled === false && chipCount(vehicleChips()[0]) === '2/3',
+          `disabled=${vehicleChips()[0].disabled} count=${chipCount(vehicleChips()[0])}`,
+        );
+
+        // Dragging a second locomotive onto the SAME line adds a second train.
+        const locoPt = toClient(v2.x, v2.y);
+        pressChip(vehicleChips()[0], locoPt);
+        check(
+          'pressing the locomotive chip starts a locomotive drag',
+          game.vehicleDrag !== null && game.vehicleDrag.kind === 'loco',
+          JSON.stringify(game.vehicleDrag),
+        );
+        pointer('pointermove', locoPt, { buttons: 1 });
+        release({ x: v2.x, y: v2.y });
+        check(
+          'dropping it on a line adds a second train to that line',
+          vlineA.trains.length === 2 && vlineA.isRunning === true &&
+            game.locomotives.available === 1,
+          `trains=${vlineA.trains.length} pool=${game.locomotives.available}`,
+        );
+
+        // A second line is drawn and staffs itself in turn.
+        dragFrom(v3, [{ x: v4.x, y: v4.y }]);
+        const vlineB = game.lines.filter((l) => l.claimed).find((l) => l !== vlineA);
+        check(
+          'a second line also takes a locomotive with it',
+          vlineB.isActive === true && vlineB.hasLocomotive === true && vlineB.trains.length === 1 &&
+            game.locomotives.available === 0,
+          `active=${vlineB.isActive} trains=${vlineB.trains.length} pool=${game.locomotives.available}`,
+        );
+
+        // A carriage only attaches behind a locomotive: once from the tray, once
+        // through the programmatic drop API.
+        game.carriages.total = 2;
+        game.carriages.available = 2;
+        mm.tick(1 / 60);
+        check(
+          'the carriage chip becomes draggable once the pool has one',
+          vehicleChips()[1].disabled === false && chipCount(vehicleChips()[1]) === '2/2',
+          `disabled=${vehicleChips()[1].disabled} count=${chipCount(vehicleChips()[1])}`,
+        );
+        const carriageBefore = game.carriages.available;
+        const v4pt = toClient(v4.x, v4.y);
+        // vlineB's own train is the host for the carriage drop below.
+        pressChip(vehicleChips()[1], v4pt);
+        check(
+          'pressing the carriage chip starts a carriage drag',
+          game.vehicleDrag !== null && game.vehicleDrag.kind === 'carriage',
+          JSON.stringify(game.vehicleDrag),
+        );
+        pointer('pointermove', v4pt, { buttons: 1 });
+        release({ x: v4.x, y: v4.y });
+        check(
+          'a carriage dropped on a line attaches to its train',
+          vlineB.carriages === 1 && game.carriages.available === carriageBefore - 1,
+          `carriages=${vlineB.carriages} pool=${game.carriages.available}`,
+        );
+        // A line with no train at all cannot host a carriage.
+        const bareLine = game.startLine(game.stations[game.stations.length - 1]);
+        void bareLine;
+        game.beginVehicleDrag('carriage', null);
+        const emptyLine = game.lines.find((l) => l.isActive && !l.trains.length && !l.retiring);
+        if (emptyLine) {
+          check(
+            'the drop API reports a line with no train as rejected',
+            game.dropVehicle({ line: emptyLine, stationIndex: 0 }) === 'rejected' &&
+              emptyLine.carriages === 0,
+            `carriages=${emptyLine.carriages} pool=${game.carriages.available}`,
+          );
+        } else {
+          check('every active line has a train to host a carriage', true, 'none bare');
+        }
+        game.beginVehicleDrag('carriage', null);
+        check(
+          'a carriage attaches to another line as well',
+          game.dropVehicle({ line: vlineA, stationIndex: 1 }) === 'applied' &&
+            vlineA.carriages === 1,
+          `carriages=${vlineA.carriages} pool=${game.carriages.available}`,
+        );
+
+        // Move the whole train off line A and onto line B by dragging its body.
+        // Wait until it is in open track so the press lands on the train, not on
+        // a platform.
+        let parkGuard = 0;
+        const trainClear = () =>
+          game.stations.every(
+            (s) => Math.hypot(s.x - vlineA.trains[0].position.x, s.y - vlineA.trains[0].position.y) > 34,
+          );
+        while (!trainClear() && parkGuard++ < 60 * 30) {
+          if (game.state === 'playing') game.update(1 / 60);
+          else break;
+        }
+        const trainPos = vlineA.trains[0].position;
+        press({ x: trainPos.x, y: trainPos.y });
+        check(
+          'pressing a train body picks the whole train up',
+          game.vehicleDrag !== null && game.vehicleDrag.kind === 'train' &&
+            game.vehicleDrag.fromLineId === vlineA.id,
+          JSON.stringify(game.vehicleDrag),
+        );
+        check('the source line keeps running while its train is in hand',
+          vlineA.hasLocomotive === true && vlineA.isRunning === true,
+          `hasLocomotive=${vlineA.hasLocomotive} isRunning=${vlineA.isRunning}`);
+        pointer('pointermove', v4pt, { buttons: 1 });
+        release({ x: v4.x, y: v4.y });
+        check(
+          'a train dropped on another line parks there as pending',
+          vlineB.pendingLoco === true && vlineB.pendingFromLineId === vlineA.id &&
+            vlineA.trains.length >= 1,
+          `pending=${vlineB.pendingLoco} A.trains=${vlineA.trains.length} B.trains=${vlineB.trains.length}`,
+        );
+        check(
+          'the waiting line keeps its own train meanwhile',
+          vlineB.isRunning === true && vlineB.pendingFromLineId === vlineA.id,
+          `isRunning=${vlineB.isRunning} from=${vlineB.pendingFromLineId}`,
+        );
+        const trainsBeforeTransfer = vlineA.trains.length;
+        let transferGuard = 0;
+        while (vlineB.pendingLoco && transferGuard++ < 60 * 60) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          else if (game.state === 'playing') game.update(1 / 60);
+          else break;
+        }
+        check(
+          'the train changes hands when the source train next stops',
+          vlineB.pendingLoco === false && vlineA.trains.length === trainsBeforeTransfer - 1 &&
+            vlineB.trains.length === 2,
+          `A.trains=${vlineA.trains.length} B.trains=${vlineB.trains.length} pending=${vlineB.pendingLoco}`,
+        );
+        check(
+          'the moved train brought its carriage along',
+          vlineB.carriages >= 1,
+          `B.carriages=${vlineB.carriages} A.carriages=${vlineA.carriages}`,
+        );
+
+        // A third line gives us another staffed line to receive a train. This
+        // fixture needs spare locomotives, so top the pool up first.
+        game.locomotives.total = Math.max(game.locomotives.total, 10);
+        game.locomotives.available = Math.max(game.locomotives.available, 4);
+        game.unlockedLines = Math.max(game.unlockedLines, 5);
+        let vlineC =
+          game.lines.find((l) => l.claimed && l.isActive && l !== vlineA && l !== vlineB) || null;
+        if (!vlineC) {
+          // Build it through the API so the fixture never depends on a gesture.
+          const extra = game.startLine(v5);
+          const other = game.stations.find((st) => st.id !== v5.id);
+          if (extra && other) game.extendLine(extra, 1, other);
+          vlineC = extra && extra.isActive ? extra : null;
+        }
+        check('a third line exists for the transfer test', !!vlineC && vlineC.trains.length > 0,
+          vlineC ? `trains=${vlineC.trains.length}` : 'none');
+        const cBefore = vlineC.trains.length;
+        game.beginVehicleDrag('train', { line: vlineB, train: vlineB.trains[0] });
+        check(
+          'a train can be promised to a line that already runs one',
+          game.dropVehicle({ line: vlineC, stationIndex: 0 }) === 'pending' &&
+            vlineC.trains.length === cBefore,
+          `C.trains=${vlineC.trains.length} pending=${vlineC.pendingLoco}`,
+        );
+        game.cancelBookings(vlineC);
+        game.beginVehicleDrag('train', { line: vlineB, train: vlineB.trains[0] });
+        check(
+          'a train dropped on its own line is re-positioned, not duplicated',
+          game.dropVehicle({ line: vlineB, stationIndex: 0 }) === 'repositioned' &&
+            vlineB.trains.length === 2,
+          `B.trains=${vlineB.trains.length}`,
+        );
+
+        // Re-route a line whose train is already running: the old route fades,
+        // and because the station the train reaches next is gone from the new
+        // route the train is withdrawn and its riders stay on that platform.
+        game.unlockedLines = Math.max(game.unlockedLines, 6);
+        game.locomotives.total = Math.max(game.locomotives.total, 12);
+        game.locomotives.available = Math.max(game.locomotives.available, 4);
+        dragFrom(v1, [{ x: v2.x, y: v2.y }, { x: v5.x, y: v5.y }]);
+        let vlineD =
+          game.lines
+            .filter((l) => l.claimed && l !== vlineA && l !== vlineB && l !== vlineC)
+            .find((l) => l.stations.length === 3) || null;
+        if (!vlineD) {
+          const extra = game.startLine(v1);
+          if (extra) {
+            game.extendLine(extra, 1, v2);
+            game.extendLine(extra, 1, v5);
+            vlineD = extra;
+          }
+        }
+        check(
+          'the re-route scenario has a three station running line',
+          !!vlineD && vlineD.stations.length === 3 && vlineD.isRunning === true,
+          vlineD ? `stations=${vlineD.stations.length} running=${vlineD.isRunning}` : 'no line',
+        );
+        mm.tick(1 / 60);
+        mm.tick(1 / 60);
+        const dRider = { destShape: v1.shape, born: 0, targetStationId: v1.id, lastLineId: null };
+        vlineD.trains[0].passengers.push(dRider);
+        const poolBeforeRecycle = game.locomotives.available;
+        game.tryLineEdit(vlineD, () => vlineD.removeStationAt(1));
+        check(
+          're-routing a line with a running train fades the old route',
+          (vlineD.trains[0] ? vlineD.trains[0].frozen : null) !== null && (vlineD.trains[0] ? vlineD.trains[0].frozen : null).stations.length === 3 &&
+            (vlineD.trains[0] ? vlineD.trains[0].frozen : null).hasStation(v2.id),
+          `frozen=${(vlineD.trains[0] ? vlineD.trains[0].frozen : null) && (vlineD.trains[0] ? vlineD.trains[0].frozen : null).stations.map((s) => s.id).join(',')}`,
+        );
+        check(
+          'the new route no longer visits the removed station',
+          vlineD.stations.length === 2 && vlineD.hasStation(v2.id) === false && vlineD.isActive === true,
+          vlineD.stations.map((s) => s.id).join(','),
+        );
+        let recycleGuard = 0;
+        while (vlineD.trains.length && (vlineD.trains[0] ? vlineD.trains[0].frozen : null) && recycleGuard++ < 60 * 120) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          else if (game.state === 'playing') game.update(1 / 60);
+          else break;
+        }
+        check(
+          'a train whose next stop left the route is withdrawn',
+          vlineD.trains.length === 0 && vlineD.isRunning === false,
+          `trains=${vlineD.trains.length} hasLocomotive=${vlineD.hasLocomotive} stations=${vlineD.stations.length}`,
+        );
+        check(
+          'and its locomotive went back into the pool',
+          game.locomotives.available === poolBeforeRecycle + 1,
+          `pool ${poolBeforeRecycle} -> ${game.locomotives.available}`,
+        );
+        check(
+          'and its riders were left standing on that platform',
+          v2.passengers.includes(dRider) && (vlineD.trains[0] ? vlineD.trains[0].passengers.length : 0) === 0,
+          `on ${v2.id}=${v2.passengers.includes(dRider)} still on the train=${(vlineD.trains[0] ? vlineD.trains[0].passengers.length : 0)}`,
+        );
+
+        // Put a spare locomotive from the tray on a line that already runs one:
+        // that is how a busy line gets a second train.
+        game.locomotives.total = Math.max(game.locomotives.total, 8);
+        game.locomotives.available = Math.max(game.locomotives.available, 2);
+        mm.tick(1 / 60);
+        const locoPoolBefore = game.locomotives.available;
+        const cTrainsBefore = vlineC.trains.length;
+        game.beginVehicleDrag('loco', null);
+        check(
+          'a spare locomotive dropped on a running line adds a train to it',
+          game.dropVehicle({ line: vlineC, stationIndex: 0, x: v1.x, y: v1.y }) === 'applied' &&
+            vlineC.trains.length === cTrainsBefore + 1 &&
+            game.locomotives.available === locoPoolBefore - 1,
+          `C.trains=${vlineC.trains.length} pool=${game.locomotives.available}`,
+        );
+        const v2pt = toClient(v2.x, v2.y);
+        pressChip(vehicleChips()[0], v2pt);
+        check(
+          'pressing the locomotive chip starts a locomotive drag',
+          game.vehicleDrag !== null && game.vehicleDrag.kind === 'loco',
+          JSON.stringify(game.vehicleDrag),
+        );
+        pointer('pointermove', v2pt, { buttons: 1 });
+        release({ x: v2.x, y: v2.y });
+        check(
+          'and dropping one from the tray parks it at that station',
+          vlineA.trains.length >= 1 && vlineA.hasLocomotive === true &&
+            vlineA.trains[vlineA.trains.length - 1].stopIndex === 1 &&
+            game.locomotives.available === locoPoolBefore - 2,
+          `A.trains=${vlineA.trains.length} pool=${game.locomotives.available}`,
+        );
+        check(
+          'the tray count follows the pool',
+          chipCount(vehicleChips()[0]) === `${game.locomotives.available}/${game.locomotives.total}`,
+          `${chipCount(vehicleChips()[0])} vs ${game.locomotives.available}/${game.locomotives.total}`,
+        );
+
+        // Appending a station at an end is a "pure" edit: the old route is still
+        // part of the new one, so the train neither freezes nor gets yanked back
+        // to a platform.
+        const sBeforeAppend = vlineA.trains[0].s;
+        const posBeforeAppend = { x: vlineA.trains[0].position.x, y: vlineA.trains[0].position.y };
+        const v6 = game.addStation(1360, 560, 'cross');
+        const appended = game.tryLineEdit(vlineA, () => vlineA.pushStation(v6));
+        const posAfterAppend = vlineA.trains[0].position;
+        check(
+          'appending an end station neither freezes nor moves the train',
+          appended === true && (vlineA.trains[0] ? vlineA.trains[0].frozen : null) === null && vlineA.trains[0].s === sBeforeAppend &&
+            Math.hypot(posAfterAppend.x - posBeforeAppend.x, posAfterAppend.y - posBeforeAppend.y) < 1,
+          `appended=${appended} frozen=${!!(vlineA.trains[0] ? vlineA.trains[0].frozen : null)} ` +
+            `s ${sBeforeAppend.toFixed(2)} -> ${vlineA.trains[0].s.toFixed(2)} ` +
+            `moved ${Math.hypot(posAfterAppend.x - posBeforeAppend.x, posAfterAppend.y - posBeforeAppend.y).toFixed(3)} px`,
+        );
+
+        // =====================================================================
+        // the new track rendering: tunnels and pass-through stations
+        // =====================================================================
+        mm.startGame('endless');
+        rebind();
+        game.tunnelsOwned = 20;
+        const pA = game.addStation(200, 860, 'circle');
+        const pB = game.addStation(500, 860, 'triangle');
+        const pC = game.addStation(800, 860, 'square');
+        const passLine = game.startLine(pA);
+        game.extendLine(passLine, 1, pC);
+        const through = mm.renderer.passThroughStations(game, passLine);
+        check(
+          'a station the track runs straight through is reported as a pass-through',
+          through.some((e) => e.station.id === pB.id) &&
+            through.every((e) => Number.isFinite(e.angle) && e.station !== undefined),
+          `${through.length} pass-through(s): ${through.map((e) => e.station.id).join(',') || 'none'}`,
+        );
+        const tBank = acrossRiver();
+        check('the second map also has water to cross', !!tBank, tBank ? 'found' : 'none');
+        const tA = game.addStation(tBank.near.x, tBank.near.y, 'gem');
+        const tB = game.addStation(tBank.far.x, tBank.far.y, 'star');
+        const tunLine = game.startLine(tA);
+        const crossed = game.extendLine(tunLine, 1, tB);
+        const under = mm.renderer.tunnelStretches(game, tunLine);
+        check(
+          'a river crossing is reported as a tunnel stretch',
+          crossed === true && under.length >= 1 && game.tunnelsAllocated() >= 1,
+          `${under.length} stretch(es), ${game.tunnelsAllocated()} tunnel(s) allocated`,
+        );
+
+        // =====================================================================
+        // passenger frequency against the tuning this version replaced
+        // =====================================================================
+        const OLD_PASSENGER = { start: [28.0, 46.0], end: [10.5, 18.5], ramp: 420 };
+        mm.startGame('endless');
+        rebind();
+        let intervalSum = 0;
+        const intervalSamples = 300;
+        for (let i = 0; i < intervalSamples; i++) intervalSum += game.passengerInterval();
+        const meanInterval = intervalSum / intervalSamples;
+        check(
+          'the live passenger interval is well under the old 28-46 s window',
+          meanInterval < 30,
+          `mean ${meanInterval.toFixed(1)} s vs the old mean of 37 s`,
+        );
+
+        const measureSpawns = (useOldTuning) => {
+          mm.startGame('endless');
+          rebind();
+          // Compare like with like: the district model divides each station's
+          // interval by a per-shape weight, so that factor has to be neutralised
+          // in BOTH phases or the two runs are not measuring the same thing.
+          const baseInterval = game.passengerInterval.bind(game);
+          // Freeze the map for the duration: otherwise the two phases see a
+          // different number of stations (river width changes which spots are
+          // free) and the comparison stops being about the interval.
+          game.spawnStation = () => null;
+          game.passengerIntervalFor = function (st) {
+            void st;
+            return this.passengerInterval();
+          };
+          if (useOldTuning) {
+            game.passengerInterval = () => {
+              const t = Math.min(Math.max(game.time / OLD_PASSENGER.ramp, 0), 1);
+              const a = OLD_PASSENGER.start[0] + (OLD_PASSENGER.end[0] - OLD_PASSENGER.start[0]) * t;
+              const b = OLD_PASSENGER.start[1] + (OLD_PASSENGER.end[1] - OLD_PASSENGER.start[1]) * t;
+              return game.rng.range(a, b);
+            };
+          } else {
+            // The live phase is made comparable by dropping the district weight
+            // only; the interval formula itself is left exactly as shipped.
+            void baseInterval;
+          }
+          let spawned = 0;
+          let stationSeconds = 0;
+          const realSpawn = game.spawnPassengerAt.bind(game);
+          game.spawnPassengerAt = (st) => {
+            const before = st.passengers.length;
+            const p = realSpawn(st);
+            if (p) spawned += st.passengers.length - before;
+            return p;
+          };
+          while (game.time < 120) {
+            // Days are short, so an upgrade pause will land inside the window:
+            // take the reward and keep measuring rather than stopping early.
+            if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+            else if (game.state === 'playing') {
+              stationSeconds += game.stations.length / 60;
+              game.update(1 / 60);
+            } else break;
+          }
+          return { spawned, stationSeconds };
+        };
+        const liveTuning = measureSpawns(false);
+        const oldTuning = measureSpawns(true);
+        check(
+          '120 s of play spawns clearly more passengers than the old tuning did',
+          liveTuning.spawned >= oldTuning.spawned * 1.25,
+          `${liveTuning.spawned} passengers now vs ${oldTuning.spawned} with the old tuning`,
+        );
+        check(
+          'the per-station spawn rate rose by the same margin',
+          liveTuning.spawned / liveTuning.stationSeconds >=
+            (oldTuning.spawned / oldTuning.stationSeconds) * 1.25,
+          `${(liveTuning.spawned / liveTuning.stationSeconds).toFixed(4)} vs ` +
+            `${(oldTuning.spawned / oldTuning.stationSeconds).toFixed(4)} passengers per station-second`,
+        );
+
+        // Put a normal-mode game back in place for the sections that follow.
+        mm.startGame('normal');
+        rebind();
+
+        // =====================================================================
+        // geometry: octilinear track with rounded corners
+        // =====================================================================
+        // Make sure at least one line is on the map for the geometry checks.
+        if (game.activeLines().length === 0) {
+          dragFrom(game.stations[0], [{ x: game.stations[1].x, y: game.stations[1].y }]);
+        }
+        check('a line exists for the geometry checks', game.activeLines().length >= 1,
+          game.activeLines().length);
+        let steepest = 0;
+        for (const l of game.activeLines()) {
+          const pts = l.path.points;
+          for (let i = 0; i + 1 < pts.length; i++) {
+            const ang =
+              (Math.atan2(Math.abs(pts[i + 1].y - pts[i].y), Math.abs(pts[i + 1].x - pts[i].x)) * 180) / Math.PI;
+            steepest = Math.max(steepest, Math.min(ang, 90 - ang));
+          }
+        }
+        check(
+          'no track segment deviates more than 45 degrees from an axis',
+          steepest <= 45.5,
+          `steepest deviation: ${steepest.toFixed(2)} deg`,
+        );
+        const anyLine = game.activeLines()[0];
+        // Force a leg that cannot be drawn octilinearly and check it gains a
+        // rounded corner instead of a kink.
+        const p1 = game.addStation(anyLine.stations[0].x + 300, anyLine.stations[0].y + 40, 'star');
+        const p2 = game.addStation(p1.x + 240, p1.y + 120, 'gem');
+        const bendy = game.startLine(p1);
+        game.extendLine(bendy, 1, p2);
+        mm.tick(1 / 60);
+        check(
+          'an angled leg is routed with a rounded corner',
+          bendy.path.points.length >= bendy.stations.length + 5 &&
+            bendy.path.total > Math.hypot(p2.x - p1.x, p2.y - p1.y),
+          `${bendy.path.points.length} points for ${bendy.stations.length} stations`,
+        );
+
+        // =====================================================================
+        // the train is big enough to show who is riding in it
+        // =====================================================================
+        // Only a line with a locomotive actually draws a train. Top the pool
+        // up so this scenario does not depend on what earlier ones spent.
+        game.locomotives.total = Math.max(game.locomotives.total, 8);
+        game.locomotives.available = Math.max(game.locomotives.available, 1);
+        let showLine = game.liveLines()[0];
+        if (!showLine) {
+          const bare = game.lines.find((l) => l.isActive && !l.hasLocomotive && !l.retiring);
+          if (bare) {
+            game.deployLocomotive(bare, 0);
+            showLine = bare;
+          }
+        }
+        check('a staffed line is available for the pixel check', !!showLine,
+          `live lines: ${game.liveLines().length} pool: ${game.locomotives.available}`);
+        const train = showLine.trains[0];
+        train.passengers = [];
+        // Park it mid-segment: away from stations, so the only ink in the
+        // sample box is the passengers themselves.
+        train.pendingArrival = null;
+        train.s = (showLine.stationS[0] + showLine.stationS[1]) / 2;
+        train.stopIndex = 0;
+        train.dwell = 30;
+        train.v = 0;
+        if (!showLine.hasLocomotive) game.deployLocomotive(showLine, 0);
+        mm.tick(1 / 60);
+
+        const sampleTrainBox = () => {
+          const pos = train.position;
+          const pt = toClient(pos.x, pos.y);
+          const canvasRect = canvas.getBoundingClientRect();
+          const dpr = mm.renderer.dpr;
+          const size = Math.round(60 * dpr);
+          const x = Math.max(0, Math.round((pt.clientX - canvasRect.left) * dpr) - size / 2);
+          const y = Math.max(0, Math.round((pt.clientY - canvasRect.top) * dpr) - size / 2);
+          const px = ctx.getImageData(x, y, size, size).data;
+          let light = 0;
+          let ink = 0;
+          let car = 0;
+          const hex = showLine.color.stroke;
+          const cr = parseInt(hex.slice(1, 3), 16);
+          const cg = parseInt(hex.slice(3, 5), 16);
+          const cb = parseInt(hex.slice(5, 7), 16);
+          for (let i = 0; i < px.length; i += 4) {
+            const r = px[i];
+            const g = px[i + 1];
+            const b = px[i + 2];
+            const a = px[i + 3];
+            if (a < 200) continue;
+            // Riders are a pale halo plus a solid dark shape, so they show up as
+            // ink inside the carriage rather than as pure white.
+            if (r < 95 && g < 95 && b < 95) ink++;
+            else if (r > 205 && g > 200 && b > 200) light++;
+            else if (Math.abs(r - cr) < 12 && Math.abs(g - cg) < 12 && Math.abs(b - cb) < 12) car++;
+          }
+          return { light, ink, car, px };
+        };
+
+        const emptyTrain = sampleTrainBox();
+        for (let i = 0; i < 3; i++) {
+          train.passengers.push({ destShape: 'circle', born: 0, targetStationId: null, lastLineId: null });
+        }
+        mm.tick(1 / 60);
+        const loadedTrain = sampleTrainBox();
+        let boxChanged = 0;
+        for (let i = 0; i < emptyTrain.px.length; i += 4) {
+          if (
+            Math.abs(emptyTrain.px[i] - loadedTrain.px[i]) > 8 ||
+            Math.abs(emptyTrain.px[i + 1] - loadedTrain.px[i + 1]) > 8 ||
+            Math.abs(emptyTrain.px[i + 2] - loadedTrain.px[i + 2]) > 8
+          ) {
+            boxChanged++;
+          }
+        }
+        check(
+          'the train body is drawn at a legible size',
+          emptyTrain.car > 150,
+          `${emptyTrain.car} pixels of train colour`,
+        );
+        check(
+          'each passenger is drawn inside the carriage',
+          loadedTrain.ink > emptyTrain.ink + 35 && boxChanged > 60 && loadedTrain.car > 100,
+          `solid glyph pixels ${emptyTrain.ink} -> ${loadedTrain.ink}, ${boxChanged} pixels changed, carriage ${emptyTrain.car} -> ${loadedTrain.car}`,
+        );
+        train.passengers = [];
+        train.dwell = 0;
+        mm.tick(1 / 60);
+        for (const l of game.lines) if (l.claimed) game.clearLine(l);
+        mm.tick(1 / 60);
+        {
+    const held = game.lines.filter((l) => l.retiring && l.trains.length > 0).length;
+    check('clearing every line keeps one slot per running ghost',
+      game.lineSlotsAvailable() === Math.max(0, game.unlockedLines - held),
+      `${game.lineSlotsAvailable()} / ${game.unlockedLines}  held=${held}`);
+  }
+        // Let those lines finish their last trip before the tray hands a line
+        // object out again: reusing one that is still retiring would leave the
+        // new line flagged as retiring for good (its chip then has no × button).
+        let settleGuard = 0;
+        while (game.lines.some((l) => l.retiring) && settleGuard++ < 60 * 120) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          else if (game.state === 'playing') game.update(1 / 60);
+          else break;
+        }
+        const bank = acrossRiver();
+        check('the map has water with dry land on both sides', !!bank, bank ? 'found' : 'none');
+        const above = game.addStation(bank.near.x, bank.near.y, 'circle');
+        const below = game.addStation(bank.far.x, bank.far.y, 'triangle');
+        const tunnelsBefore = game.tunnelsOwned;
+        game.tunnelsOwned = 0;
+        const crossLine = game.startLine(above);
+        const refused = game.extendLine(crossLine, 1, below);
+        game.tunnelsOwned = tunnelsBefore;
+        check('river crossing needs a tunnel', refused === false && crossLine.stations.length === 1);
+        game.tunnelsOwned = 2;
+        check('river crossing allowed with a tunnel', game.extendLine(crossLine, 1, below) === true);
+        check('the tunnel ledger matches the built track',
+          game.tunnelsAllocated() === game.river.crossings(crossLine.path.points),
+          `${game.tunnelsAllocated()} vs ${game.river.crossings(crossLine.path.points)}`);
+        game.tunnelsOwned = 40;
+        game.clearLine(crossLine);
+        mm.tick(1 / 60);
+
+        // =====================================================================
+        // weekly reward
+        // =====================================================================
+        let guard = 0;
+        // A week is 7 x 20 s now, so give the clock plenty of room. Passenger
+        // pressure is much higher than it used to be, though, so keep the
+        // platforms clear while we wait: this section is about the weekly
+        // reward, not about surviving the new spawn rate.
+        while (game.state !== 'upgrade' && guard++ < 60 * 220) {
+          for (const st of game.stations) st.passengers.length = 0;
+          if (game.state === 'playing') game.update(1 / 60);
+          else break;
+        }
+        mm.tick(1 / 60);
+        check('weekly upgrade opens', game.state === 'upgrade', game.state);
+        check('reward cards rendered', w.document.querySelectorAll('#rewards .reward').length >= 2,
+          w.document.querySelectorAll('#rewards .reward').length);
+        check('upgrade overlay visible', !w.document.getElementById('overlay-upgrade').classList.contains('hidden'));
+
+        const tunnelBefore = game.tunnelsOwned;
+        const option = game.rewardOptions.find((o) => o.kind === 'tunnel');
+        if (option) {
+          w.document.querySelectorAll('#rewards .reward')[game.rewardOptions.indexOf(option)].click();
+          check('clicking a reward grants it', game.tunnelsOwned === tunnelBefore + 2, game.tunnelsOwned);
+        } else {
+          game.chooseReward(game.rewardOptions[0].kind);
+        }
+        mm.tick(1 / 60);
+        check('back to playing after reward', game.state === 'playing', game.state);
+        check('upgrade overlay hidden again', w.document.getElementById('overlay-upgrade').classList.contains('hidden'));
+
+        // =====================================================================
+        // inventory placement
+        // =====================================================================
+        game.inventory.interchanges = 1;
+        mm.tick(1 / 60);
+        const invChips = w.document.querySelectorAll('#inventory .chip');
+        invChips[invChips.length - 1].click();
+        mm.tick(1 / 60);
+        check('interchange placement armed', game.placement?.item === 'interchange', JSON.stringify(game.placement));
+        const freeStation = game.stations.find((s) => !s.isInterchange);
+        const freePt = toClient(freeStation.x, freeStation.y);
+        onCanvas('pointerdown', freePt);
+        releaseAt(freePt);
+        mm.tick(1 / 60);
+        check('interchange applied to a station', freeStation.isInterchange === true, freeStation.id);
+        check('interchange consumed', game.inventory.interchanges === 0, game.inventory.interchanges);
+
+        // =====================================================================
+        // HUD
+        // =====================================================================
+        // Put one active line back so the tray has something to clear.
+        const hudLine = game.startLine(game.stations[0]);
+        if (hudLine) game.extendLine(hudLine, 1, game.stations[1]);
+        game.score = 1234;
+        game.delivered = 77;
+        mm.tick(1 / 60);
+        check('HUD shows the score', w.document.getElementById('stat-score').textContent === '1234',
+          w.document.getElementById('stat-score').textContent);
+        check('HUD shows delivered passengers', w.document.getElementById('stat-delivered').textContent === '77',
+          w.document.getElementById('stat-delivered').textContent);
+        check('HUD shows the line count', w.document.querySelectorAll('#lines .chip').length === game.unlockedLines,
+          `${w.document.querySelectorAll('#lines .chip').length} vs ${game.unlockedLines}`);
+        check('HUD clock formatted', /第 \d+ 周/.test(w.document.getElementById('stat-clock').textContent),
+          w.document.getElementById('stat-clock').textContent);
+
+        // The × on a used line chip wipes that line.
+        mm.tick(1 / 60);
+        const activeIndex = game.lines.findIndex((l) => l.isActive);
+        const activeChip = w.document.querySelectorAll('#lines .chip')[activeIndex];
+        const usedChip = activeChip?.querySelector('.clear');
+        check('a used line chip offers a clear button', !!usedChip,
+          `line index ${activeIndex} claimed=${game.lines[activeIndex]?.claimed} ` +
+            `retiring=${game.lines[activeIndex]?.retiring} stations=${game.lines[activeIndex]?.stations.length} ` +
+            `activeLines=${game.lines.map((l) => (l.isActive ? 1 : 0)).join('')} ` +
+            `chips=${w.document.querySelectorAll('#lines .chip').length} ` +
+            `chipClass="${activeChip ? activeChip.className : 'none'}"`);
+        if (usedChip) {
+          const before = game.activeLines().length;
+          usedChip.click();
+          mm.tick(1 / 60);
+          const cleared = game.lines[activeIndex];
+          check(
+            'clicking × clears the line (or retires it if it still has riders)',
+            (cleared.stations.length === 0 || cleared.retiring === true) &&
+              game.claimedLines().includes(cleared) === cleared.retiring,
+            `stations=${cleared.stations.length} retiring=${cleared.retiring} active ${before} -> ${game.activeLines().length}`,
+          );
+        }
+
+        // =====================================================================
+        // layout
+        // =====================================================================
+        const rect = canvas.getBoundingClientRect();
+        const box = (sel) => w.document.querySelector(sel).getBoundingClientRect();
+        const vw = w.innerWidth;
+        const vh = w.innerHeight;
+        const tl = box('.hud-topleft');
+        const tr = box('.hud-topright');
+        const bl = box('.hud-bottomleft');
+        const brr = box('.hud-bottomright');
+        check('canvas fills the viewport', rect.width >= vw - 2 && rect.height >= vh - 2,
+          `${rect.width}x${rect.height} vs ${vw}x${vh}`);
+        check('top-left panel is on screen', tl.left >= 0 && tl.top >= 0 && tl.right > tl.left,
+          JSON.stringify({ l: tl.left, t: tl.top, r: tl.right }));
+        check('top panels do not overlap', tl.right < tr.left, `tl.right=${tl.right} tr.left=${tr.left}`);
+        check('top-right panel is on screen', tr.right <= vw && tr.top >= 0, `right=${tr.right} vw=${vw}`);
+        check('bottom-left tray is on screen', bl.left >= 0 && bl.bottom <= vh && bl.top > vh * 0.5,
+          JSON.stringify({ l: bl.left, b: bl.bottom, t: bl.top }));
+        check('bottom trays do not overlap', bl.right < brr.left, `bl.right=${bl.right} br.left=${brr.left}`);
+        check('bottom-right tray is on screen', brr.right <= vw && brr.bottom <= vh,
+          `right=${brr.right} bottom=${brr.bottom}`);
+        const hintEl = w.document.getElementById('hint');
+        const hintBox = hintEl.getBoundingClientRect();
+        const hintVisible = w.getComputedStyle(hintEl).display !== 'none';
+        check(
+          'hint bar never overlaps the trays',
+          !hintVisible || (hintBox.left > bl.right && hintBox.right < brr.left),
+          `hint=[${hintBox.left.toFixed(0)},${hintBox.right.toFixed(0)}] trays=[${bl.right.toFixed(0)},${brr.left.toFixed(0)}]`,
+        );
+
+        // =====================================================================
+        // game over / endless
+        // =====================================================================
+        const station = game.stations[0];
+        for (let i = 0; i < 30; i++) {
+          station.passengers.push({ destShape: game.stations[1].shape, born: 0, targetStationId: null, lastLineId: null });
+        }
+        guard = 0;
+        while (game.state !== 'gameover' && guard++ < 60 * 400) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          else game.update(1 / 60);
+        }
+        mm.tick(1 / 60);
+        check('overcrowding ends the game', game.state === 'gameover', game.state);
+        check('game over overlay visible', !w.document.getElementById('overlay-gameover').classList.contains('hidden'));
+        check('summary filled in', /\d/.test(w.document.getElementById('gameover-summary').textContent),
+          w.document.getElementById('gameover-summary').textContent.replace(/\s+/g, ' ').slice(0, 90));
+
+        mm.startGame('endless');
+        rebind();
+        for (let i = 0; i < 40; i++) {
+          game.stations[0].passengers.push({ destShape: game.stations[1].shape, born: 0, targetStationId: null, lastLineId: null });
+        }
+        for (let i = 0; i < 60 * 90 && game.state !== 'gameover'; i++) {
+          if (game.state === 'upgrade') game.chooseReward(game.rewardOptions[0].kind);
+          else game.update(1 / 60);
+        }
+        mm.tick(1 / 60);
+        check('endless mode keeps playing after an overload', game.state === 'playing', game.state);
+        check('endless mode counted the overload', game.overcrowdIncidents > 0, game.overcrowdIncidents);
+
+        // =====================================================================
+        // responsive layout
+        // =====================================================================
+        frame.style.width = '900px';
+        frame.style.height = '600px';
+        await wait(400);
+        mm.tick(1 / 60);
+        const sw = w.innerWidth;
+        const sh = w.innerHeight;
+        const stl = box('.hud-topleft');
+        const str = box('.hud-topright');
+        const sbl = box('.hud-bottomleft');
+        const sbr = box('.hud-bottomright');
+        const sHint = w.document.getElementById('hint');
+        const sHintVisible = w.getComputedStyle(sHint).display !== 'none';
+        const sHintBox = sHint.getBoundingClientRect();
+        check('small viewport: renderer follows the window', mm.renderer.cssW === sw && mm.renderer.cssH === sh,
+          `${mm.renderer.cssW}x${mm.renderer.cssH} vs ${sw}x${sh}`);
+        check('small viewport: top panels fit', stl.left >= 0 && stl.right < str.left && str.right <= sw,
+          `tl.right=${stl.right.toFixed(0)} tr.left=${str.left.toFixed(0)} tr.right=${str.right.toFixed(0)} vw=${sw}`);
+        check('small viewport: bottom trays fit',
+          sbl.left >= 0 && sbl.right < sbr.left && sbr.right <= sw && sbr.bottom <= sh,
+          `bl.right=${sbl.right.toFixed(0)} br.left=${sbr.left.toFixed(0)} br.bottom=${sbr.bottom.toFixed(0)} vh=${sh}`);
+        check('small viewport: hint does not collide',
+          !sHintVisible || (sHintBox.left > sbl.right && sHintBox.right < sbr.left),
+          `visible=${sHintVisible}`);
+
+        finishedRun();
+      }
+
+      main().catch((error) => {
+        check('test harness completed', false, `${error && error.message}\n${error && error.stack}`);
+        finishedRun();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "mini-metro-clone",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A faithful, dependency-free Mini Metro style metro-planning game (canvas + vanilla ES modules).",
+  "scripts": {
+    "start": "node tools/serve.mjs",
+    "test": "node --test tests/",
+    "build": "node tools/build.mjs"
+  }
+}
